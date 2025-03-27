@@ -15,18 +15,17 @@ def convert_pdf_to_images(pdf_path: str, output_folder: str) -> None:
     print(f"All pages of {pdf_name} saved as images.")
 
 
-def extract_pdf_pages_text(pdf_path: str, output_folder: str, by_blocks= False) -> None:
-    """ 
-    Extracts text from a PDF file page by page and saves it in a JSON file.
-    Each page is stored as a list of lines or blocks depending on by_blocks arg.
-    """
+def extract_pdf_text(pdf_path: str, output_folder: str, by_blocks= False, separated_pages= True) -> None:
+    """ Extracts text from a PDF and saves it in a JSON file"""
     if not os.path.exists(output_folder):
         os.makedirs(output_folder)
-    pages = []
+    
     doc = fitz.open(pdf_path)
+    pages = {}  # for seperated pages
+    all_text = [] 
     if by_blocks:
         try:
-            print(f"Extracting page blocks for: {pdf_path}")
+            print(f"Extracting blocks for: {pdf_path}")
             for page_num, page in enumerate(doc): 
                 page_blocks = []       
                 blocks = page.get_text('blocks') 
@@ -34,13 +33,14 @@ def extract_pdf_pages_text(pdf_path: str, output_folder: str, by_blocks= False) 
                     block = el[4].replace("\t", " ").replace("\n", " ").strip()
                     if block.strip():
                         page_blocks.append(block)
-                pages.append(page_blocks)
+                        all_text.append(block)
+                pages[page_num+1] = page_blocks
         except Exception as e:
-            raise Exception(f"Error extracting page blocks from {pdf_path}: {e}")
+            raise Exception(f"Error extracting blocks from {pdf_path}: {e}")
     else:
         try:
-            print(f"Extracting page lines for: {pdf_path}")
-            for page in doc:
+            print(f"Extracting lines for: {pdf_path}")
+            for page_num ,page in enumerate(doc):
                 page_lines = []
                 page_dict = page.get_text("dict")  # extract text as dictionary
                 for el in page_dict['blocks']:
@@ -49,61 +49,98 @@ def extract_pdf_pages_text(pdf_path: str, output_folder: str, by_blocks= False) 
                             fixed_line = ''.join(span['text'] for span in line['spans'])
                             if fixed_line.strip():  
                                 page_lines.append(fixed_line.strip())
-                pages.append(page_lines)
+                                all_text.append(fixed_line.strip()) 
+                pages[page_num+1] = page_lines
         except Exception as e:
-            raise Exception(f"Error extracting page lines from {pdf_path}: {e}")
+            raise Exception(f"Error extracting lines from {pdf_path}: {e}")
     
     doc.close()
     print(f"{len(pages)} total pages transcibed")
     pdf_name = os.path.basename(pdf_path).split(".")[0]
     suffix = "by_blocks" if by_blocks else "by_lines"
-    output_path = os.path.join(output_folder, f"{pdf_name}_pages_{suffix}.json")
-    with open(output_path, "w", encoding="utf-8") as file:
-        json.dump(pages, file, ensure_ascii=False, indent=4)
+    output_path = os.path.join(output_folder, f"{pdf_name}_{suffix}.json")
+    if separated_pages:
+        with open(output_path, "w", encoding="utf-8") as file:
+            json.dump(pages, file, ensure_ascii=False, indent=4)
+    else:
+        with open(output_path, "w", encoding="utf-8") as file:
+            json.dump(all_text, file, ensure_ascii=False, indent=4)
     print(f"Saved {output_path}")
 
 
-def extract_pdf_text(pdf_path: str, output_folder: str, by_blocks= False) -> None:           
-    """Extrcats and saves all text from a pdf file in a single list of lines or blocks depending on by_blocks arg, in a JSON file"""
+
+def extract_pdf_text_and_images(pdf_path: str, output_folder: str, by_blocks= False):
+    """Extracts text and images from each page of a PDF, saving text with image filenames inline."""
     if not os.path.exists(output_folder):
         os.makedirs(output_folder)
+
     doc = fitz.open(pdf_path)
-    all_text = []
-    if by_blocks:
-        try:
-            print(f"Extracting blocks for: {pdf_path}")
-            for page_num, page in enumerate(doc):      
-                blocks = page.get_text('blocks') 
-                for el in blocks:  
-                    block = el[4].replace("\t", " ").replace("\n", " ").strip()
-                    if block.strip():
-                        all_text.append(block)
-        except Exception as e:
-            raise Exception(f"Error extracting blocks from {pdf_path}: {e}")
-    else:
-        try:
-            print(f"Extracting lines for: {pdf_path}")
-            for page_num, page in enumerate(doc):
-                page_dict = page.get_text("dict") 
-                for el in page_dict['blocks']:      # blocks , lines, spans
-                    if el['type'] == 0:             # type is 0 for text, 1 for image
-                        for line in el['lines']:     
-                            fixed_line = ''.join(span['text'] for span in line['spans'])
-                            if fixed_line.strip():
-                                all_text.append(fixed_line.strip())  
-        except Exception as e:
-            raise Exception(f"Error extracting lines from {pdf_path}: {e}")
+    pdf_data = {}  
+    for page_num in range(len(doc)):
+        page = doc.load_page(page_num)
+        page_text = []  
+        extracted_xrefs = set()
+        
+        if by_blocks:
+            text_blocks = page.get_text("blocks")  # extracts text as blocks (paragraphs)
+            text_content = sorted(
+                [(block[1], block[4].replace("\t", " ").replace("\n", " ").strip()) for block in text_blocks if block[4].strip()],
+                key=lambda x: x[0]  # sort by y0 coordinate - block=(0, 100, 500, 150, "Hello World"),  # (x0, y0, x1, y1, text)
+            )
+        else:
+            text_lines = page.get_text("dict")["blocks"]
+            text_content = []
+            for block in text_lines:
+                if block["type"] != 0:  # skip non-text blocks
+                    continue
+                for line in block["lines"]:
+                    line_bbox = line["bbox"] # (x0, y0, x1, y1)
+                    line_text = " ".join([span["text"] for span in line["spans"]]).strip()
+                    if line_text:
+                        text_content.append((line_bbox[1], line_text))
+            text_content.sort(key=lambda x: x[0])  # sort by y0 position
+        
+        # Extract images and insert filenames into the text
+        images = []
+        for img_index, img in enumerate(page.get_images(full=True)):
+            xref = img[0]
+            if xref in extracted_xrefs:
+                continue
+            extracted_xrefs.add(xref)
+
+            base_image = doc.extract_image(xref)
+            image_bytes = base_image["image"]
+            image_ext = base_image["ext"]
+
+            image_filename = f"{os.path.basename(pdf_path).split('.')[0]}_page{page_num + 1}_img{img_index + 1}.{image_ext}"
+            image_path = os.path.join(output_folder, image_filename)
+            
+            with open(image_path, "wb") as img_file:
+                img_file.write(image_bytes)
+            print(f"Saved: {image_filename}")
+
+            image_bbox = fitz.Rect(page.get_image_bbox(img))
+            images.append((image_bbox.y0, image_filename))  # store y0 position and filename
+        
+        # Merge text and images into page_text in reading order (sort by y0)
+        all_content = sorted(text_content + images, key=lambda x: x[0])
+        
+        for y0, content in all_content:
+            page_text.append(content)
+        pdf_data[page_num + 1] = page_text
     
     doc.close()
-    pdf_name = os.path.basename(pdf_path).split(".")[0]
+    # Save extracted text with images inline
     suffix = "by_blocks" if by_blocks else "by_lines"
-    output_path = os.path.join(output_folder, f"{pdf_name}_text_{suffix}.json")
-    with open(output_path, "w", encoding='utf-8') as file:
-        json.dump(all_text, file, ensure_ascii= False, indent= 4)
-    print(f"Saved {output_path}")
+    json_filename = os.path.join(output_folder, f"{os.path.basename(pdf_path).split('.')[0]}_text_and_images_{suffix}.json")
+    with open(json_filename, 'w', encoding='utf-8') as json_file:
+        json.dump(pdf_data, json_file, indent=4, ensure_ascii=False)
+    print(f"Text and images data saved to: {json_filename}")
+    
+    return pdf_data
 
 
-def extract_pdf_pages_images(pdf_path: str, output_folder: str, by_blocks = False):
+def extract_pdf_images(pdf_path: str, output_folder: str, by_blocks = False):
     """Extracts and saves images and their position wrt the text (lines or blocks of text depending on by_blocks arg) for each page in a pdf file"""
     if not os.path.exists(output_folder):
         os.makedirs(output_folder)
@@ -197,7 +234,7 @@ def extract_pdf_pages_images(pdf_path: str, output_folder: str, by_blocks = Fals
     return image_data
 
 
-def extract_unique_images_from_pdf(pdf_path, output_folder):
+def extract_pdf_unique_images(pdf_path, output_folder):
     """Extracts and saves all unique images in a pdf files."""
     if not os.path.exists(output_folder):
         os.makedirs(output_folder)
